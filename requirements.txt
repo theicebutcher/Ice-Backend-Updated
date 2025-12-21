@@ -8,3 +8,4 @@ requests
 google-genai
 psutil
 gunicorn
+cloudinary
