@@ -1,6 +1,6 @@
 import os
 import base64
-from flask import Flask, render_template, request, jsonify, session
+from flask import Flask, request, jsonify, session
 import openai
 from dotenv import load_dotenv
 import json
@@ -11,7 +11,7 @@ import io
 import logging
 import requests
 import datetime
-from flask import Flask, request, send_file, jsonify, render_template
+from flask import Flask, request, send_file, jsonify
 from google import genai
 from google.genai import types
 import pathlib
@@ -164,18 +164,6 @@ def upload_and_save_generated_image(file_path, prompt, template_type, original_f
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode("utf-8")
-
-@app.route("/", methods=["GET"])
-def index():
-    return render_template("index.html")
-
-@app.route("/generated-gallery", methods=["GET"])
-def generated_gallery():
-    return render_template("generated_gallery.html")
-
-@app.route("/favorites-gallery", methods=["GET"])
-def favorites_gallery():
-    return render_template("favorites_gallery.html")
 
 def classify_prompt_type(prompt):
     classification_messages = [
