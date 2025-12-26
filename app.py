@@ -1,6 +1,6 @@
 import os
 import base64
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify, session, send_file
 import openai
 from dotenv import load_dotenv
 import json
@@ -11,11 +11,13 @@ import io
 import logging
 import requests
 import datetime
-from flask import Flask, request, send_file, jsonify
 from google import genai
 from google.genai import types
 import pathlib
-from werkzeug.utils import secure_filename  # Add this import at the top
+from werkzeug.utils import secure_filename
+import tempfile
+import shutil
+
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 
@@ -90,10 +92,6 @@ def save_generated_image(b64_data: str, upload_dir: str, base_name: str):
             return tmp_png_path
     return tmp_png_path
 
-
-# Load FAQ data (unchanged)
-with open('faq.json', 'r', encoding='utf-8') as file:
-    faq_data = json.load(file)
 
 app = Flask(__name__)
 CORS(app)
@@ -416,18 +414,37 @@ def submit_feedback():
         if not image_url or not rating:
             return jsonify({'error': 'Missing image_url or rating'}), 400
 
-        # Convert relative URL to absolute file path
-        base_dir = os.path.abspath(os.path.dirname(__file__))
-        image_path = os.path.join(base_dir, 'static/uploads', os.path.basename(image_url))
-        print(f"Attempting to read image from: {image_path}")  # Debug log
+        base64_image = ""
+        
+        # Handle Cloudinary/External URLs
+        if image_url.startswith('http'):
+            try:
+                img_response = requests.get(image_url)
+                if img_response.status_code == 200:
+                    base64_image = base64.b64encode(img_response.content).decode('utf-8')
+                else:
+                    return jsonify({'error': f'Failed to download image from URL: {image_url}'}), 400
+            except Exception as e:
+                return jsonify({'error': f'Error downloading image: {str(e)}'}), 500
+        
+        # Handle Local Files (Legacy/Fallback)
+        else:
+            # Convert relative URL to absolute file path
+            base_dir = os.path.abspath(os.path.dirname(__file__))
+            # Handle /static/ prefix if present
+            clean_path = image_url.replace('/static/', '').replace('static/', '')
+            image_path = os.path.join(base_dir, 'static', clean_path)
+            
+            print(f"Attempting to read image from: {image_path}")
 
-        if not os.path.exists(image_path):
-            return jsonify({'error': f'Image file not found at {image_path}'}), 404
+            if not os.path.exists(image_path):
+                return jsonify({'error': f'Image file not found at {image_path}'}), 404
 
-        # Read the image file and convert to Base64
-        with open(image_path, 'rb') as image_file:
-            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-            print(f"Base64 length: {len(base64_image)}")  # Debug log
+            # Read the image file and convert to Base64
+            with open(image_path, 'rb') as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        print(f"Base64 length: {len(base64_image)}")
 
         # Prepare feedback data for Google Apps Script
         feedback_data = {
@@ -573,48 +590,48 @@ def extract_logo():
         if file.filename == '':
             return jsonify({"error": "No file selected"}), 400
 
-        # Securely save the uploaded file
-        filename = secure_filename(file.filename)
-        upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        try:
-            file.save(upload_path)
-            optimize_saved_image(upload_path)
-            logging.debug(f"Upload saved & optimized: {upload_path}")
-        except Exception as e:
-            return jsonify({"error": f"Error saving file: {e}"}), 500
+        # Use temp directory for processing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            filename = secure_filename(file.filename)
+            upload_path = os.path.join(temp_dir, filename)
+            try:
+                file.save(upload_path)
+                optimize_saved_image(upload_path)
+                logging.debug(f"Upload saved & optimized: {upload_path}")
+            except Exception as e:
+                return jsonify({"error": f"Error saving file: {e}"}), 500
 
-        logging.debug(f"Received file: {file.filename}")
+            logging.debug(f"Received file: {file.filename}")
 
-        # Open & prepare a working copy (downscaled) for the model
-        try:
-            with Image.open(upload_path) as img:
-                img = img.convert('RGB')
-                if img.width > WORKING_THUMB_SIDE or img.height > WORKING_THUMB_SIDE:
-                    img.thumbnail((WORKING_THUMB_SIDE, WORKING_THUMB_SIDE), Image.LANCZOS)
-                model_image = img.copy()
-        except Exception as e:
-            return jsonify({"error": f"Error opening image with PIL: {e}"}), 400
+            # Open & prepare a working copy (downscaled) for the model
+            try:
+                with Image.open(upload_path) as img:
+                    img = img.convert('RGB')
+                    if img.width > WORKING_THUMB_SIDE or img.height > WORKING_THUMB_SIDE:
+                        img.thumbnail((WORKING_THUMB_SIDE, WORKING_THUMB_SIDE), Image.LANCZOS)
+                    model_image = img.copy()
+            except Exception as e:
+                return jsonify({"error": f"Error opening image with PIL: {e}"}), 400
 
-        prompt = "Extract the logo from this image and display it on a pure white background, tightly cropped."  # Clarified prompt
-        response = client2.models.generate_content(
-            model=PRO_MODEL_ID,
-            contents=[prompt, model_image],
-            config=types.GenerateContentConfig(response_modalities=['Text', 'Image'])
-        )
+            prompt = "Extract the logo from this image and display it on a pure white background, tightly cropped."
+            response = client2.models.generate_content(
+                model=PRO_MODEL_ID,
+                contents=[prompt, model_image],
+                config=types.GenerateContentConfig(response_modalities=['Text', 'Image'])
+            )
 
-        for part in response.candidates[0].content.parts:
-            if part.inline_data is not None:
-                data = part.inline_data.data
-                logo_path = os.path.join(app.config['UPLOAD_FOLDER'], 'extracted_logo.png')
-                try:
-                    pathlib.Path(logo_path).write_bytes(data)
-                    optimize_saved_image(logo_path)
-                    return send_file(logo_path, mimetype='image/png')
-                except Exception as e:
-                    return jsonify({"error": f"Error writing image to file: {e}"}), 500
+            for part in response.candidates[0].content.parts:
+                if part.inline_data is not None:
+                    data = part.inline_data.data
+                    logo_path = os.path.join(temp_dir, 'extracted_logo.png')
+                    try:
+                        pathlib.Path(logo_path).write_bytes(data)
+                        optimize_saved_image(logo_path)
+                        return send_file(logo_path, mimetype='image/png')
+                    except Exception as e:
+                        return jsonify({"error": f"Error writing image to file: {e}"}), 500
 
-        return jsonify({"error": "No image returned from model"}), 500
-
+            return jsonify({"error": "No image returned from model"}), 500
 
     except Exception as e:
         print("Error extracting logo:", str(e))
@@ -669,50 +686,57 @@ def expand_chatbot():
         if not uploaded_files:
             return jsonify({"response": "No image provided for expansion"}), 400
 
-        # Process just the first image
-        uploaded_file = uploaded_files[0]
-        uploaded_file.stream.seek(0, os.SEEK_END)
-        size = uploaded_file.stream.tell(); uploaded_file.stream.seek(0)
-        if size > MAX_UPLOAD_BYTES:
-            return jsonify({"response": f"File too large. Max {MAX_UPLOAD_BYTES//1024//1024}MB"}), 400
-        combined_id = uuid.uuid4().hex[:8]
-        combined_path = os.path.join(app.config["UPLOAD_FOLDER"], f"combined_{combined_id}.jpg")
-        uploaded_file.save(combined_path)
-        optimize_saved_image(combined_path)
+        # Use temp directory for processing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Process just the first image
+            uploaded_file = uploaded_files[0]
+            uploaded_file.stream.seek(0, os.SEEK_END)
+            size = uploaded_file.stream.tell(); uploaded_file.stream.seek(0)
+            if size > MAX_UPLOAD_BYTES:
+                return jsonify({"response": f"File too large. Max {MAX_UPLOAD_BYTES//1024//1024}MB"}), 400
+            
+            combined_id = uuid.uuid4().hex[:8]
+            combined_path = os.path.join(temp_dir, f"combined_{combined_id}.jpg")
+            uploaded_file.save(combined_path)
+            optimize_saved_image(combined_path)
 
-        # Generate using ONLY the user's prompt
-        print("Generating image using ONLY user input:", user_input)
-        with Image.open(combined_path) as img:
-            img = img.convert('RGB')
-            response = client2.models.generate_content(
-                model=PRO_MODEL_ID,
-                contents=[user_input, img],
-                config=types.GenerateContentConfig(
-                    response_modalities=['Image'],
-                    # image_config=types.ImageConfig(aspect_ratio=user_aspect_ratio if user_aspect_ratio else "9:16") # ImageConfig not supported in this version
+            # Generate using ONLY the user's prompt
+            print("Generating image using ONLY user input:", user_input)
+            with Image.open(combined_path) as img:
+                img = img.convert('RGB')
+                response = client2.models.generate_content(
+                    model=PRO_MODEL_ID,
+                    contents=[user_input, img],
+                    config=types.GenerateContentConfig(
+                        response_modalities=['Image'],
+                        # image_config=types.ImageConfig(aspect_ratio=user_aspect_ratio if user_aspect_ratio else "9:16") # ImageConfig not supported in this version
+                    )
                 )
+
+            # Save and return the result
+            output_id = uuid.uuid4().hex[:8]
+            output_filename = f"sculpture_{output_id}.png"
+            output_path = os.path.join(temp_dir, output_filename)
+            
+            for part in response.candidates[0].content.parts:
+                if part.inline_data is not None:
+                    pathlib.Path(output_path).write_bytes(part.inline_data.data)
+                    optimize_saved_image(output_path)
+                    break
+            
+            # Upload to Cloudinary and save to Supabase
+            final_image_url = upload_and_save_generated_image(
+                output_path, 
+                "Expand Image", 
+                "expand", 
+                output_filename
             )
+            
+            if not final_image_url:
+                 return jsonify({"response": "Error saving generated image"}), 500
 
-        # Save and return the result
-        output_id = uuid.uuid4().hex[:8]
-        output_path = os.path.join(app.config["GENERATED_FOLDER"], f"sculpture_{output_id}.png")
-        for part in response.candidates[0].content.parts:
-            if part.inline_data is not None:
-                pathlib.Path(output_path).write_bytes(part.inline_data.data)
-                optimize_saved_image(output_path)
-                break
-        output_filename = os.path.basename(output_path)
-
-        # Upload to Cloudinary and save to Supabase
-        upload_and_save_generated_image(
-            output_path, 
-            "Expand Image", 
-            "expand", 
-            output_filename
-        )
-
-        print("Image generated successfully. Returning:", {"image_url": f"/static/generated/{output_filename}"})
-        return jsonify({"image_url": f"/static/generated/{output_filename}"})
+            print("Image generated successfully. Returning:", {"image_url": final_image_url})
+            return jsonify({"image_url": final_image_url})
 
     except Exception as e:
         logging.exception("expand_chatbot failed")
@@ -746,77 +770,96 @@ def chatbot():
         print(f"Using {selected_ice_cube} ice cube prompt with user input:\n{image_generation_prompt}")
         session.pop('selected_ice_cube', None)
         
-        # Save uploaded files and process ONLY with ice cube prompt
-        uploaded_paths = []
-        if uploaded_files:
-            uploaded_ids = [uuid.uuid4().hex[:8] for _ in uploaded_files]
-            uploaded_paths = [os.path.join(app.config["UPLOAD_FOLDER"], f"uploaded_{id}.jpg") for id in uploaded_ids]
-            for i, file in enumerate(uploaded_files):
-                file.stream.seek(0, os.SEEK_END)
-                size = file.stream.tell(); file.stream.seek(0)
-                if size > MAX_UPLOAD_BYTES:
-                    return jsonify({"response": f"One of the files is too large (>{MAX_UPLOAD_BYTES//1024//1024}MB)"})
-                file.save(uploaded_paths[i])
-                optimize_saved_image(uploaded_paths[i])
-                logging.debug(f"Saved & optimized uploaded file: {uploaded_paths[i]}")
-        
-        combined_id = uuid.uuid4().hex[:8]
-        combined_path = os.path.join(app.config["UPLOAD_FOLDER"], f"combined_{combined_id}.jpg")
-
-        if uploaded_paths:
-            try:
-                combine_images(uploaded_paths, combined_path)
-                logging.debug(f"Combined image saved to: {combined_path}")
-            except ValueError as e:
-                return jsonify({"response": str(e)})
-            except Exception as e:
-                return jsonify({"response": f"Error combining images: {str(e)}"})
-        else:
-            return jsonify({"response": "No valid images provided"})
-        
-        # Generate image with ONLY ice cube prompt
-        try:
-            with Image.open(combined_path) as img:
-                img = img.convert('RGB')
-                response = client2.models.generate_content(
-                    model=PRO_MODEL_ID,
-                    contents=[image_generation_prompt, img],
-                    config=types.GenerateContentConfig(
-                        response_modalities=['Image'],
-                        # image_config=types.ImageConfig(aspect_ratio=user_aspect_ratio if user_aspect_ratio else "1:1") # ImageConfig not supported
-                    )
-                )
-            output_id = uuid.uuid4().hex[:8]
-            output_path = os.path.join(app.config["GENERATED_FOLDER"], f"sculpture_{output_id}.png")
-            for part in response.candidates[0].content.parts:
-                if part.inline_data is not None:
-                    pathlib.Path(output_path).write_bytes(part.inline_data.data)
-                    optimize_saved_image(output_path)
-                    break
-            output_filename = os.path.basename(output_path)
-            print("Ice Cube Image Created")
+        # Use temp directory for processing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            uploaded_paths = []
+            cloudinary_urls = []
             
-            # Upload to Cloudinary and save to Supabase
-            upload_and_save_generated_image(
-                output_path, 
-                image_generation_prompt, 
-                "ice_cube", 
-                output_filename
-            )
+            if uploaded_files:
+                for file in uploaded_files:
+                    # Save to temp file
+                    temp_path = os.path.join(temp_dir, secure_filename(file.filename))
+                    file.stream.seek(0, os.SEEK_END)
+                    size = file.stream.tell(); file.stream.seek(0)
+                    if size > MAX_UPLOAD_BYTES:
+                        return jsonify({"response": f"One of the files is too large (>{MAX_UPLOAD_BYTES//1024//1024}MB)"})
+                    file.save(temp_path)
+                    optimize_saved_image(temp_path)
+                    uploaded_paths.append(temp_path)
+                    
+                    # Upload input to Cloudinary
+                    try:
+                        upload_result = cloudinary.uploader.upload(
+                            temp_path,
+                            folder="input_images",
+                            public_id=f"input_{uuid.uuid4().hex[:8]}"
+                        )
+                        cloudinary_urls.append(upload_result.get("secure_url"))
+                    except Exception as e:
+                        logging.error(f"Failed to upload input to Cloudinary: {e}")
 
-            session["conversation"].append({"role": "user", "content": user_input})
-            session["conversation"].append({
-                "role": "assistant", 
-                "content": "Here is your ice sculpture:",
-                "image": f"/static/generated/{output_filename}"
-            })
-            session.modified = True
+            combined_path = os.path.join(temp_dir, f"combined_{uuid.uuid4().hex[:8]}.jpg")
 
-            return jsonify({
-                "image_url": f"/static/generated/{output_filename}"
-            })
-        except Exception as e:
-            return jsonify({"response": f"Error generating ice cube image: {str(e)}"})
+            if uploaded_paths:
+                try:
+                    combine_images(uploaded_paths, combined_path)
+                    logging.debug(f"Combined image saved to: {combined_path}")
+                except ValueError as e:
+                    return jsonify({"response": str(e)})
+                except Exception as e:
+                    return jsonify({"response": f"Error combining images: {str(e)}"})
+            else:
+                return jsonify({"response": "No valid images provided"})
+            
+            # Generate image with ONLY ice cube prompt
+            try:
+                with Image.open(combined_path) as img:
+                    img = img.convert('RGB')
+                    response = client2.models.generate_content(
+                        model=PRO_MODEL_ID,
+                        contents=[image_generation_prompt, img],
+                        config=types.GenerateContentConfig(
+                            response_modalities=['Image'],
+                        )
+                    )
+                
+                # Save generated image to temp file first
+                output_id = uuid.uuid4().hex[:8]
+                output_filename = f"sculpture_{output_id}.png"
+                output_path = os.path.join(temp_dir, output_filename)
+                
+                for part in response.candidates[0].content.parts:
+                    if part.inline_data is not None:
+                        pathlib.Path(output_path).write_bytes(part.inline_data.data)
+                        optimize_saved_image(output_path)
+                        break
+                
+                print("Ice Cube Image Created")
+                
+                # Upload to Cloudinary and save to Supabase
+                final_image_url = upload_and_save_generated_image(
+                    output_path, 
+                    image_generation_prompt, 
+                    "ice_cube", 
+                    output_filename
+                )
+
+                if not final_image_url:
+                     return jsonify({"response": "Error saving generated image"}), 500
+
+                session["conversation"].append({"role": "user", "content": user_input, "images": cloudinary_urls})
+                session["conversation"].append({
+                    "role": "assistant", 
+                    "content": "Here is your ice sculpture:",
+                    "image": final_image_url
+                })
+                session.modified = True
+
+                return jsonify({
+                    "image_url": final_image_url
+                })
+            except Exception as e:
+                return jsonify({"response": f"Error generating ice cube image: {str(e)}"})
 
     # Convert to lowercase after checking prefixes
     user_input_lower = user_input.lower()
@@ -839,15 +882,34 @@ def chatbot():
         
     # If user uploaded images or we detected base images
     if uploaded_files or base_images:
-        # Save any uploaded files
+        # Use temp directory for processing
+        temp_dir = tempfile.mkdtemp()
         uploaded_paths = []
+        cloudinary_urls = []
+        
+        # Save uploaded files to temp dir
         if uploaded_files:
-            uploaded_ids = [uuid.uuid4().hex[:8] for _ in uploaded_files]
-            uploaded_paths = [os.path.join(app.config["UPLOAD_FOLDER"], f"uploaded_{id}.jpg") for id in uploaded_ids]
-            for i, file in enumerate(uploaded_files):
-                file.save(uploaded_paths[i])
-                optimize_saved_image(uploaded_paths[i])
-                logging.debug(f"Saved & optimized uploaded file: {uploaded_paths[i]}")
+            for file in uploaded_files:
+                temp_path = os.path.join(temp_dir, secure_filename(file.filename))
+                file.stream.seek(0, os.SEEK_END)
+                size = file.stream.tell(); file.stream.seek(0)
+                if size > MAX_UPLOAD_BYTES:
+                    shutil.rmtree(temp_dir)
+                    return jsonify({"response": f"One of the files is too large (>{MAX_UPLOAD_BYTES//1024//1024}MB)"})
+                file.save(temp_path)
+                optimize_saved_image(temp_path)
+                uploaded_paths.append(temp_path)
+                
+                # Upload to Cloudinary
+                try:
+                    upload_result = cloudinary.uploader.upload(
+                        temp_path,
+                        folder="input_images",
+                        public_id=f"input_{uuid.uuid4().hex[:8]}"
+                    )
+                    cloudinary_urls.append(upload_result.get("secure_url"))
+                except Exception as e:
+                    logging.error(f"Failed to upload input to Cloudinary: {e}")
         
         # Get full paths to any detected base images
         base_image_paths = [os.path.join("static", img) for img in base_images] if base_images else []
@@ -857,6 +919,7 @@ def chatbot():
         all_image_paths = uploaded_paths + base_image_paths
         
         if not all_image_paths:
+             shutil.rmtree(temp_dir)
              return jsonify({"response": "No valid images provided"})
         
 
@@ -882,6 +945,7 @@ def chatbot():
                     "Extra_ice": "Do NOT ADD EXTRA ICE TO THE SCULPTURE, ONLY THE ORIGINAL IMAGE SHOULD BE USED",
                     "contours": "Preserve all original contours and features precisely",
                     "size": "Sculpture should be large, around 6 to 7 feet tall or wide accordingly",
+                    "ice_color":"Ice is always clear and not colored, the blue color indicates clear, transparent ice (dark-blue is thicker than light-blue)",
                     "color_coding": "CRITICAL: Blue color in the input reference image is ONLY A TEMPLATE INDICATOR showing where ice should be. The OUTPUT sculpture MUST BE COMPLETELY WHITE/CLEAR TRANSPARENT ICE, NOT BLUE. Light blue in reference means recess in the ice. Any other color in reference means it is made of paper and not ice. TRANSFORM ALL BLUE PARTS INTO REALISTIC WHITE/CLEAR TRANSPARENT ICE IN THE FINAL IMAGE. The final result should NEVER show blue ice - only clear/white transparent ice.",
                     "CRITICAL_NO_NEW_SCULPTURES": "DO NOT create new sculptures like deer, bear, animals, or any other sculptures that are not in the reference image. ONLY render what is shown in the uploaded reference images. If toppers are added, place them ON TOP of the existing sculpture - do not replace or add new main sculptures"
                 },
@@ -1083,7 +1147,8 @@ def chatbot():
                     print(f"Error loading image {path}: {e}")
 
         if not image_inputs:
-            return jsonify({'error': 'No valid images provided'}), 400
+            shutil.rmtree(temp_dir)
+            return jsonify({"response": "Failed to process any images"})
 
         # Debug logging
         print(f"DEBUG: Using aspect_ratio = {aspect_ratio} (user selected: {user_aspect_ratio})")
@@ -1148,12 +1213,14 @@ def chatbot():
                 "image": final_image_url
             })
             session.modified = True
-
+            
+            shutil.rmtree(temp_dir)
             return jsonify({
                 # "response": "Here's your custom ice sculpture:",
                 "image_url": final_image_url
             })
         except Exception as e:
+            shutil.rmtree(temp_dir)
             return jsonify({"response": f"Error generating sculpture image: {str(e)}"})
 
     # If no images were uploaded or detected, proceed with text/classification flow
@@ -1211,35 +1278,40 @@ def chatbot():
                 )
             )
 
-            output_path = os.path.join(app.config["UPLOAD_FOLDER"], f"generated_{generation_id}.png")
-            for part in response.candidates[0].content.parts:
-                if part.inline_data is not None:
-                    pathlib.Path(output_path).write_bytes(part.inline_data.data)
-                    optimize_saved_image(output_path)
-                    break
-            output_filename = os.path.basename(output_path)
-            print("Image Created")
+            # Use temp directory for processing
+            with tempfile.TemporaryDirectory() as temp_dir:
+                output_path = os.path.join(temp_dir, f"generated_{generation_id}.png")
+                for part in response.candidates[0].content.parts:
+                    if part.inline_data is not None:
+                        pathlib.Path(output_path).write_bytes(part.inline_data.data)
+                        optimize_saved_image(output_path)
+                        break
+                output_filename = os.path.basename(output_path)
+                print("Image Created")
 
-            # Upload to Cloudinary and save to Supabase
-            upload_and_save_generated_image(
-                output_path, 
-                image_generation_prompt, 
-                "text_to_image", 
-                output_filename
-            )
+                # Upload to Cloudinary and save to Supabase
+                cloudinary_url = upload_and_save_generated_image(
+                    output_path, 
+                    image_generation_prompt, 
+                    "text_to_image", 
+                    output_filename
+                )
+                
+                # Use Cloudinary URL if available, otherwise fallback to local (though we want to avoid local)
+                final_image_url = cloudinary_url if cloudinary_url else f"/static/uploads/{output_filename}"
 
-            session["conversation"].append({"role": "user", "content": user_input})
-            session["conversation"].append({
-                "role": "assistant", 
-                "content": "Here is your ice sculpture:",
-                "image": f"/static/uploads/{output_filename}"
-            })
-            session.modified = True
+                session["conversation"].append({"role": "user", "content": user_input})
+                session["conversation"].append({
+                    "role": "assistant", 
+                    "content": "Here is your ice sculpture:",
+                    "image": final_image_url
+                })
+                session.modified = True
 
-            return jsonify({
-                "response": "Here is your ice sculpture:",
-                "image_url": f"/static/uploads/{output_filename}"
-            })
+                return jsonify({
+                    "response": "Here is your ice sculpture:",
+                    "image_url": final_image_url
+                })
 
     except Exception as e:
         return jsonify({"response": f"Error: {str(e)}"})
