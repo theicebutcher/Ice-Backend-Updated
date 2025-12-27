@@ -94,7 +94,7 @@ def save_generated_image(b64_data: str, upload_dir: str, base_name: str):
 
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, supports_credentials=True)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "default-secret-key")  # Required for sessions
 app.config["UPLOAD_FOLDER"] = "static/uploads"
 app.config["GENERATED_FOLDER"] = "static/generated"
@@ -122,7 +122,7 @@ supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(supabase_url, supabase_key)
 
-def upload_and_save_generated_image(file_path, prompt, template_type, original_filename):
+def upload_and_save_generated_image(file_path, prompt, template_type, original_filename, template_name=None):
     """
     Uploads a generated image to Cloudinary and saves its URL and metadata to Supabase.
     """
@@ -140,7 +140,8 @@ def upload_and_save_generated_image(file_path, prompt, template_type, original_f
             "image_url": image_url,
             "prompt": prompt,
             "template_type": template_type,
-            "original_filename": original_filename
+            "original_filename": original_filename,
+            "template_name": template_name
         }
         supabase.table("generated_images").insert(data).execute()
         logging.info(f"Successfully saved generated image to Supabase: {image_url}")
@@ -558,6 +559,7 @@ def handle_template_selection():
         print(f"Selected template name: {template_name}")
     
     # Store the template type in session if it's an ice cube
+    session['selected_template_name'] = template_name
     if template_type in ICE_CUBE_PROMPTS:
         session['selected_ice_cube'] = template_type
         print(f"Ice cube selected: {template_type}")  # This will now print for ice cubes
@@ -678,6 +680,7 @@ def expand_chatbot():
     user_input = request.form.get("user_input", "").strip()
     uploaded_files = request.files.getlist("images")
     user_aspect_ratio = request.form.get("aspect_ratio", "9:16")  # Get user's selected aspect ratio
+    template_name = request.form.get("template_name") or session.get('selected_template_name')
 
     print("expand_chatbot route was hit!")
 
@@ -729,7 +732,8 @@ def expand_chatbot():
                 output_path, 
                 "Expand Image", 
                 "expand", 
-                output_filename
+                output_filename,
+                template_name=template_name
             )
             
             if not final_image_url:
@@ -758,6 +762,7 @@ def chatbot():
     user_input = request.form.get("user_input", "").strip()
     uploaded_files = request.files.getlist("images")
     user_aspect_ratio = request.form.get("aspect_ratio", "9:16")  # Get user's selected aspect ratio
+    template_name = request.form.get("template_name") or session.get('selected_template_name')
     logging.debug(f"Received request.files: {request.files}")
     logging.debug(f"User selected aspect ratio: {user_aspect_ratio}")
 
@@ -841,7 +846,8 @@ def chatbot():
                     output_path, 
                     image_generation_prompt, 
                     "ice_cube", 
-                    output_filename
+                    output_filename,
+                    template_name=template_name
                 )
 
                 if not final_image_url:
@@ -945,7 +951,6 @@ def chatbot():
                     "Extra_ice": "Do NOT ADD EXTRA ICE TO THE SCULPTURE, ONLY THE ORIGINAL IMAGE SHOULD BE USED",
                     "contours": "Preserve all original contours and features precisely",
                     "size": "Sculpture should be large, around 6 to 7 feet tall or wide accordingly",
-                    "ice_color":"Ice is always clear and not colored, the blue color indicates clear, transparent ice (dark-blue is thicker than light-blue)",
                     "color_coding": "CRITICAL: Blue color in the input reference image is ONLY A TEMPLATE INDICATOR showing where ice should be. The OUTPUT sculpture MUST BE COMPLETELY WHITE/CLEAR TRANSPARENT ICE, NOT BLUE. Light blue in reference means recess in the ice. Any other color in reference means it is made of paper and not ice. TRANSFORM ALL BLUE PARTS INTO REALISTIC WHITE/CLEAR TRANSPARENT ICE IN THE FINAL IMAGE. The final result should NEVER show blue ice - only clear/white transparent ice.",
                     "CRITICAL_NO_NEW_SCULPTURES": "DO NOT create new sculptures like deer, bear, animals, or any other sculptures that are not in the reference image. ONLY render what is shown in the uploaded reference images. If toppers are added, place them ON TOP of the existing sculpture - do not replace or add new main sculptures"
                 },
@@ -1200,7 +1205,8 @@ def chatbot():
                 output_path, 
                 image_generation_prompt, 
                 "sculpture", 
-                output_filename
+                output_filename,
+                template_name=template_name
             )
             
             # Use Cloudinary URL if available, otherwise fallback to local (though we want to avoid local)
@@ -1294,7 +1300,8 @@ def chatbot():
                     output_path, 
                     image_generation_prompt, 
                     "text_to_image", 
-                    output_filename
+                    output_filename,
+                    template_name=template_name
                 )
                 
                 # Use Cloudinary URL if available, otherwise fallback to local (though we want to avoid local)
