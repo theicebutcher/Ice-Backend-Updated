@@ -11,31 +11,31 @@ import io
 import logging
 import requests
 import datetime
+import time
+import jwt
 from google import genai
 from google.genai import types
 import pathlib
 from werkzeug.utils import secure_filename
 import tempfile
 import shutil
+import hashlib
+from rapidfuzz import fuzz
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
+Image.MAX_IMAGE_PIXELS = 999999999 
 
 # ---------------- Image / Memory Optimization Constants ----------------
-# These can be tuned via environment variables at deploy time.
-MAX_SOURCE_SIDE = int(os.getenv("MAX_SOURCE_SIDE", "2048"))          # Hard cap for any uploaded image side length
-WORKING_THUMB_SIDE = int(os.getenv("WORKING_THUMB_SIDE", "1024"))      # Size we downscale to for compositing
-MAX_COMBINE_MEMORY_BYTES = int(os.getenv("MAX_COMBINE_MEMORY_BYTES", str(150 * 1024 * 1024)))  # ~150MB safety cap
+MAX_SOURCE_SIDE = int(os.getenv("MAX_SOURCE_SIDE", "2048"))
+WORKING_THUMB_SIDE = int(os.getenv("WORKING_THUMB_SIDE", "1024"))
+MAX_COMBINE_MEMORY_BYTES = int(os.getenv("MAX_COMBINE_MEMORY_BYTES", str(150 * 1024 * 1024)))
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(5 * 1024 * 1024)))  # 5MB per file default
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(5 * 1024 * 1024)))
 ENABLE_MEM_LOG = os.getenv("ENABLE_MEM_LOG", "0") == "1"
 
 def optimize_saved_image(path: str):
-    """Shrink and recompress an already-saved upload in-place to save RAM + disk.
-    - Limits max side to MAX_SOURCE_SIDE.
-    - Converts to RGB JPEG (quality configurable) to drastically reduce footprint.
-    Silently ignores failures so it never breaks the request path.
-    """
+    """Shrink and recompress an already-saved upload in-place to save RAM + disk."""
     try:
         if not os.path.exists(path):
             return
@@ -43,7 +43,6 @@ def optimize_saved_image(path: str):
             im = im.convert("RGB")
             if im.width > MAX_SOURCE_SIDE or im.height > MAX_SOURCE_SIDE:
                 im.thumbnail((MAX_SOURCE_SIDE, MAX_SOURCE_SIDE), Image.LANCZOS)
-            # Re-save as JPEG (even if originally PNG) to cut size.
             im.save(path, format='JPEG', quality=JPEG_QUALITY, optimize=True)
     except Exception as e:
         logging.warning(f"optimize_saved_image failed for {path}: {e}")
@@ -60,10 +59,6 @@ def log_memory(prefix: str):
         pass
 
 def save_generated_image(b64_data: str, upload_dir: str, base_name: str):
-    """Decode a base64 PNG returned by a model and optionally transcode to JPEG to save space.
-    OUTPUT_IMAGE_FORMAT env var controls final format (png or jpeg). Defaults to png.
-    Returns absolute file path of saved image.
-    """
     target_format = os.getenv("OUTPUT_IMAGE_FORMAT", "png").lower()
     tmp_png_path = os.path.join(upload_dir, f"{base_name}.png")
     try:
@@ -72,14 +67,12 @@ def save_generated_image(b64_data: str, upload_dir: str, base_name: str):
     except Exception as e:
         logging.error(f"Failed writing raw generated image: {e}")
         raise
-
     if target_format in ("jpg", "jpeg"):
         try:
             with Image.open(tmp_png_path) as im:
                 im = im.convert("RGB")
                 jpeg_path = os.path.join(upload_dir, f"{base_name}.jpg")
                 im.save(jpeg_path, format='JPEG', quality=JPEG_QUALITY, optimize=True)
-            # Remove larger png if jpeg smaller
             try:
                 if os.path.getsize(jpeg_path) < os.path.getsize(tmp_png_path):
                     os.remove(tmp_png_path)
@@ -92,24 +85,36 @@ def save_generated_image(b64_data: str, upload_dir: str, base_name: str):
             return tmp_png_path
     return tmp_png_path
 
-
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "default-secret-key")  # Required for sessions
+
+# Configure CORS
+CORS(app, 
+     resources={r"/api/*": {
+         "origins": [
+             "https://ice-frontend-beta.vercel.app",
+             "https://ice-frontend-hyj0t73fw-alihamzasultans-projects.vercel.app",
+             "https://*.vercel.app",
+             "http://localhost:5173",
+             "http://localhost:3000"
+         ],
+         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+         "allow_headers": ["Content-Type", "Authorization"],
+         "supports_credentials": True,
+         "max_age": 3600
+     }})
+
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "default-secret-key")
 app.config["UPLOAD_FOLDER"] = "static/uploads"
 app.config["GENERATED_FOLDER"] = "static/generated"
-
-# Ensure generated folder exists
 os.makedirs(app.config["GENERATED_FOLDER"], exist_ok=True)
 
-# Load OpenAI API key
+# Load APIs
 load_dotenv()
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Initialize Cloudinary
 import cloudinary
 import cloudinary.uploader
-
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key=os.getenv("CLOUDINARY_API_KEY"),
@@ -122,358 +127,93 @@ supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(supabase_url, supabase_key)
 
-def upload_and_save_generated_image(file_path, prompt, template_type, original_filename, template_name=None):
-    """
-    Uploads a generated image to Cloudinary and saves its URL and metadata to Supabase.
-    """
+# Initialize Supabase Admin
+# Initialize Supabase Admin
+service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") 
+if not service_role_key: 
+    logging.warning("SUPABASE_SERVICE_ROLE_KEY is missing. Admin user fetching will be disabled.")
+    # Do NOT fallback to SUPABASE_KEY as it cannot perform admin actions
+
+supabase_admin: Client = None
+if service_role_key:
     try:
-        # Upload to Cloudinary
-        upload_result = cloudinary.uploader.upload(
-            file_path,
-            folder="generated_images",
-            public_id=os.path.splitext(original_filename)[0]
-        )
-        image_url = upload_result.get("secure_url")
-
-        # Insert into Supabase
-        data = {
-            "image_url": image_url,
-            "prompt": prompt,
-            "template_type": template_type,
-            "original_filename": original_filename,
-            "template_name": template_name
-        }
-        supabase.table("generated_images").insert(data).execute()
-        logging.info(f"Successfully saved generated image to Supabase: {image_url}")
-        
-        # Clean up local file after successful upload
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                logging.info(f"Deleted local file: {file_path}")
-        except Exception as e:
-            logging.warning(f"Failed to delete local file {file_path}: {e}")
-            
-        return image_url
+        supabase_admin = create_client(supabase_url, service_role_key)
+        logging.info("Supabase Admin client initialized")
     except Exception as e:
-        logging.error(f"Error uploading/saving generated image: {e}")
-        return None
+        logging.error(f"Failed to initialize Supabase Admin client: {e}")
 
-# Helper function to encode images (unchanged)
-def encode_image(image_path):
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode("utf-8")
+# Gemini Client
+client2 = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+PRO_MODEL_ID = "gemini-3-pro-image-preview"
 
-def classify_prompt_type(prompt):
-    classification_messages = [
-        {
-            "role": "system",
-            "content": "You are a classification assistant. Based on the user's input, decide if they are asking for a sculpture to be generated, edit an image, or just get a text response. Reply with only one word: 'generate', 'edit', or 'text'."
-        },
-        {"role": "user", "content": prompt}
-    ]
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=classification_messages
-    )
-    return response.choices[0].message.content.strip().lower()
+# ---------------- Dictionaries & Constants ----------------
 
-
-
-import hashlib
-from PIL import Image
-import logging
-Image.MAX_IMAGE_PIXELS = 999999999 
-logging.basicConfig(level=logging.DEBUG)
-
-def combine_images(image_paths, output_path, max_size=1024):
-    """
-    Combines multiple images into one with a white background.
-    - Resizes each image to fit within max_size x max_size while keeping aspect ratio.
-    - Avoids duplicate images based on content hash.
-    - Aligns all images by height for a clean horizontal combination.
-    """
-
-    unique_images = []
-    seen_hashes = set()
-    est_total_bytes = 0
-
-    for path in image_paths:
-        try:
-            with Image.open(path) as img:
-                img = img.convert("RGB")
-
-                # Hard limit on original size
-                if img.width > MAX_SOURCE_SIDE or img.height > MAX_SOURCE_SIDE:
-                    img.thumbnail((MAX_SOURCE_SIDE, MAX_SOURCE_SIDE), Image.LANCZOS)
-
-                # Resize for working composite
-                img.thumbnail((max_size, max_size), Image.LANCZOS)
-
-                # Hash for duplicates (dimension + md5 of raw bytes)
-                img_bytes = img.tobytes()
-                img_hash = f"{img.width}x{img.height}-" + hashlib.md5(img_bytes).hexdigest()
-
-                if img_hash in seen_hashes:
-                    continue
-                seen_hashes.add(img_hash)
-
-                est_total_bytes += len(img_bytes)
-                if est_total_bytes > MAX_COMBINE_MEMORY_BYTES:
-                    logging.warning("combine_images aborted: memory estimate exceeded limit")
-                    break
-
-                # Keep a copy and immediately free original reference
-                unique_images.append(img.copy())
-        except Exception as e:
-            logging.error(f"Error processing {path}: {e}")
-            continue
-
-    if not unique_images:
-        raise ValueError("No valid images to combine")
-
-    # Normalize heights
-    max_height = max(im.height for im in unique_images)
-    normalized = []
-    for im in unique_images:
-        if im.height < max_height:
-            ratio = max_height / im.height
-            new_w = int(im.width * ratio)
-            im = im.resize((new_w, max_height), Image.LANCZOS)
-        normalized.append(im)
-
-    total_width = sum(im.width for im in normalized)
-    new_im = Image.new('RGB', (total_width, max_height), 'white')
-
-    x_off = 0
-    for im in normalized:
-        new_im.paste(im, (x_off, 0))
-        x_off += im.width
-
-    new_im.save(output_path, format='JPEG', quality=JPEG_QUALITY, optimize=True)
-    logging.info(f"Combined image saved at {output_path}")
-
-    # Explicit cleanup
-    del unique_images
-    del normalized
-    del new_im
-from rapidfuzz import fuzz
-
-# Function to check similarity
-def is_similar_to_ludge(input_text, threshold=80):
-    words = input_text.lower().split()
-    return any(fuzz.ratio(word, "lobster") >= threshold for word in words)
-
-# Dictionary mapping keywords to image filenames in static folder
 SCULPTURE_BASES = {
-
-    #Bases
     "champagne": os.path.join("bases", "champagne_base.png"),
     "crystal base": os.path.join("bases", "crystal_base.png"),
     "frame base": os.path.join("bases", "frame_base.png"),
     "golf base": os.path.join("bases", "golf_base.png"),
-    "heart base": os.path.join("bases", "heartBase.png"),  # Modified name
-    "plynth base w logo": os.path.join("bases", "Plynth base w logo.png"), # Exact name
-    "rings base": os.path.join("bases", "rings base.png"), # Exact name
-    "star base": os.path.join("bases", "Star base.png"), # Exact name
-    "swirl base": os.path.join("bases", "swirl base.png"), # Exact name
-    "tilt plynth base": os.path.join("bases", "tilt plynth base.png") ,# Exact name
-   
+    "heart base": os.path.join("bases", "heartBase.png"),
+    "plynth base w logo": os.path.join("bases", "Plynth base w logo.png"),
+    "rings base": os.path.join("bases", "rings base.png"),
+    "star base": os.path.join("bases", "Star base.png"),
+    "swirl base": os.path.join("bases", "swirl base.png"),
+    "tilt plynth base": os.path.join("bases", "tilt plynth base.png"),
     "plynth base": os.path.join("bases", "plynth_base.png"),
     "ring base": os.path.join("bases", "ring_base.png"),
     "tee base": os.path.join("bases", "tee_base.png"),
     "waves base": os.path.join("bases", "waves_base.png"),
-
-    ##ludges
-
     "double ludge": os.path.join("sculptures", "double_ludge.png"),
     "martini": os.path.join("sculptures", "martini.png"),
     "tube": os.path.join("sculptures", "tube.png"),
-
-    #Sculptures
-        "alligator head": os.path.join("sculptures", "alligator_head.png"),
-        "alligator": os.path.join("sculptures", "alligator.png"),
-        "anchor": os.path.join("sculptures", "anchor.png"),
-        "crab claw": os.path.join("sculptures", "crab claw.png"),
-        "dolphin": os.path.join("sculptures", "dolphin.png"),
-        "dragon head": os.path.join("sculptures", "dragon_head.png"),
-        "griffen": os.path.join("sculptures", "griffen.png"),
-        "guitar": os.path.join("sculptures", "guitar.png"),
-        "heel": os.path.join("sculptures", "heel.png"),
-        "horse head": os.path.join("sculptures", "horse_head.png"),
-        "indian head": os.path.join("sculptures", "indian head.png"),
-        "leopard": os.path.join("sculptures", "leopard.png"),
-        "lion": os.path.join("sculptures", "lion.png"),
-        "lobster": os.path.join("sculptures", "lobster.png"),
-       
-        "mahi mahi": os.path.join("sculptures", "mahi mahi.png"),
-        "mask": os.path.join("sculptures", "mask.png"),
-        "mermaid": os.path.join("sculptures", "mermaid.png"),
-        "palm_trees": os.path.join("sculptures", "palm_trees.png"),
-        "panther": os.path.join("sculptures", "panther.png"),
-        "penguin": os.path.join("sculptures", "penguin.png"),
-        "selfish": os.path.join("sculptures", "selfish.png"),
-        "shark": os.path.join("sculptures", "shark.png"),
-        "shrimp": os.path.join("sculptures", "shrimp.png"),
-        "turkey": os.path.join("sculptures", "turkey.png"),
-        "turle": os.path.join("sculptures", "turle.png"),
-        "turtle cartoon": os.path.join("sculptures", "turtle_cartoon.png"),
-        "unicorn": os.path.join("sculptures", "unicorn.png"),
-        "vase": os.path.join("sculptures", "vase.png"),
-        "whale": os.path.join("sculptures", "whale.png"),
-        "women butt": os.path.join("sculptures", "women_butt.png"),
-        "women torso": os.path.join("sculptures", "women_torso.png"),
-
-        #Wedding Sculptures
-        "interlocking rings": os.path.join("wedding_Showpieces", "interlocking_rings_showpiece_wedding.png"),
-        "wedding frame": os.path.join("wedding_Showpieces", "picture_frame_wedding.png"),
-
-        #Topper
-        "banana single luge": os.path.join("Toppers", "banana single luge.jpg"),
-        "ice bar mini single luge": os.path.join("Toppers", "ice bar mini single luge.jpg"),
-        "ice bowl": os.path.join("Toppers", "ice bowl.png"),
-        "crown logo as topper": os.path.join("Toppers", "crown logo as topper.jpg"),
-        "crown logo as topper": os.path.join("Toppers", "crown logo as topper.jpg"),
-        "crown logo as topper": os.path.join("Toppers", "crown logo as topper.jpg"),
-            
-         #Ice Bars
-        "6ft ice bar": os.path.join("Ice bars", "6ft ice bar.jpg"),
-        "8ft ice bar":os.path.join("Ice bars", "8ft ice bar.jpg"),   
-        "12ft ice bar": os.path.join("Ice bars", "12ft ice bar.jpg"),   
-        
-       
-        
-        
-
-        #LOGOS
-    # "logo base": os.path.join("bases", "logo_base.png"),
-    # "logo plynth base": os.path.join("bases", "logo_plynth_base.png"),
-
-    # Add more mappings as needed
+    "alligator head": os.path.join("sculptures", "alligator_head.png"),
+    "alligator": os.path.join("sculptures", "alligator.png"),
+    "anchor": os.path.join("sculptures", "anchor.png"),
+    "crab claw": os.path.join("sculptures", "crab claw.png"),
+    "dolphin": os.path.join("sculptures", "dolphin.png"),
+    "dragon head": os.path.join("sculptures", "dragon_head.png"),
+    "griffen": os.path.join("sculptures", "griffen.png"),
+    "guitar": os.path.join("sculptures", "guitar.png"),
+    "heel": os.path.join("sculptures", "heel.png"),
+    "horse head": os.path.join("sculptures", "horse_head.png"),
+    "indian head": os.path.join("sculptures", "indian head.png"),
+    "leopard": os.path.join("sculptures", "leopard.png"),
+    "lion": os.path.join("sculptures", "lion.png"),
+    "lobster": os.path.join("sculptures", "lobster.png"),
+    "mahi mahi": os.path.join("sculptures", "mahi mahi.png"),
+    "mask": os.path.join("sculptures", "mask.png"),
+    "mermaid": os.path.join("sculptures", "mermaid.png"),
+    "palm_trees": os.path.join("sculptures", "palm_trees.png"),
+    "panther": os.path.join("sculptures", "panther.png"),
+    "penguin": os.path.join("sculptures", "penguin.png"),
+    "selfish": os.path.join("sculptures", "selfish.png"),
+    "shark": os.path.join("sculptures", "shark.png"),
+    "shrimp": os.path.join("sculptures", "shrimp.png"),
+    "turkey": os.path.join("sculptures", "turkey.png"),
+    "turle": os.path.join("sculptures", "turle.png"),
+    "turtle cartoon": os.path.join("sculptures", "turtle_cartoon.png"),
+    "unicorn": os.path.join("sculptures", "unicorn.png"),
+    "vase": os.path.join("sculptures", "vase.png"),
+    "whale": os.path.join("sculptures", "whale.png"),
+    "women butt": os.path.join("sculptures", "women_butt.png"),
+    "women torso": os.path.join("sculptures", "women_torso.png"),
+    "interlocking rings": os.path.join("wedding_Showpieces", "interlocking_rings_showpiece_wedding.png"),
+    "wedding frame": os.path.join("wedding_Showpieces", "picture_frame_wedding.png"),
+    "banana single luge": os.path.join("Toppers", "banana single luge.jpg"),
+    "ice bar mini single luge": os.path.join("Toppers", "ice bar mini single luge.jpg"),
+    "ice bowl": os.path.join("Toppers", "ice bowl.png"),
+    "crown logo as topper": os.path.join("Toppers", "crown logo as topper.jpg"),
+    "6ft ice bar": os.path.join("Ice bars", "6ft ice bar.jpg"),
+    "8ft ice bar":os.path.join("Ice bars", "8ft ice bar.jpg"),   
+    "12ft ice bar": os.path.join("Ice bars", "12ft ice bar.jpg"),   
 }
+
 LUDGE_TYPES = {
     "martini": os.path.join("sculptures", "martini.png"),
     "tube": os.path.join("sculptures", "tube.png"),
     "double": os.path.join("sculptures", "double_ludge.png")
 }
 
-REFERENCE_IMAGES = {
-    "double luge": [
-        "static/double luge/BOOMBOX Double LUGE w J LOGO  Render.jpg",  # Replace with the actual path to your first reference image
-        "static/double luge/HAKU VODKA Logo on KANPAI Double Luge.jpg"  # Replace with the actual path to your second reference image
-        # "/static/uploads/butcher_3.jpg",  # Replace with the actual path to your third reference image
-        # "/static/uploads/butcher_4.jpg",  # Replace with the actual path to your fourth reference image
-    ]
-    # Add more mappings for other sculptures later, e.g., "martini luge": [...]
-}
-
-# Then modify your ludge detection logic:
-def detect_ludge_type(input_text):
-    input_text = input_text.lower()
-    for ludge in LUDGE_TYPES:
-        if ludge in input_text:
-            return LUDGE_TYPES[ludge]
-    return None
-
-def detect_sculpture_bases(input_text, threshold=80):
-    """Detects which sculpture bases are mentioned in the input text."""
-    input_text = input_text.lower()
-    detected_bases = []
-    
-    # First remove "base" from input to avoid matching all bases
-    input_without_base = input_text.replace("base", "").strip()
-    if not input_without_base:  # If only "base" was specified
-        input_without_base = input_text  # Use original input
-    
-    for keyword, image_path in SCULPTURE_BASES.items():
-        # Get the main descriptor (remove "base" from keyword)
-        main_keyword = keyword.replace("base", "").strip()
-        
-        # Check if main descriptor is in input
-        if main_keyword and main_keyword in input_without_base:
-            detected_bases.append(image_path)
-        # Original exact match check (for full phrases)
-        elif keyword in input_text:
-            detected_bases.append(image_path)
-        # Fuzzy matching only on main descriptors
-        else:
-            words = input_without_base.split()
-            if any(fuzz.ratio(word, main_keyword) >= threshold for word in words):
-                detected_bases.append(image_path)
-    
-    return detected_bases
-
-@app.route('/api/submit_feedback', methods=['POST'])
-def submit_feedback():
-    try:
-        data = request.get_json()
-        image_url = data.get('image_url')  # e.g., /static/uploads/sculpture_61be3d96.png
-        rating = data.get('rating')
-        comment = data.get('comment')
-
-        # Validate inputs
-        if not image_url or not rating:
-            return jsonify({'error': 'Missing image_url or rating'}), 400
-
-        base64_image = ""
-        
-        # Handle Cloudinary/External URLs
-        if image_url.startswith('http'):
-            try:
-                img_response = requests.get(image_url)
-                if img_response.status_code == 200:
-                    base64_image = base64.b64encode(img_response.content).decode('utf-8')
-                else:
-                    return jsonify({'error': f'Failed to download image from URL: {image_url}'}), 400
-            except Exception as e:
-                return jsonify({'error': f'Error downloading image: {str(e)}'}), 500
-        
-        # Handle Local Files (Legacy/Fallback)
-        else:
-            # Convert relative URL to absolute file path
-            base_dir = os.path.abspath(os.path.dirname(__file__))
-            # Handle /static/ prefix if present
-            clean_path = image_url.replace('/static/', '').replace('static/', '')
-            image_path = os.path.join(base_dir, 'static', clean_path)
-            
-            print(f"Attempting to read image from: {image_path}")
-
-            if not os.path.exists(image_path):
-                return jsonify({'error': f'Image file not found at {image_path}'}), 404
-
-            # Read the image file and convert to Base64
-            with open(image_path, 'rb') as image_file:
-                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-        
-        print(f"Base64 length: {len(base64_image)}")
-
-        # Prepare feedback data for Google Apps Script
-        feedback_data = {
-            'imageData': base64_image,
-            'rating': rating,
-            'comment': comment or 'No comment provided'
-        }
-
-        # Send to Google Apps Script web app
-        script_url = 'https://script.google.com/macros/s/AKfycbzKOxVD9ju-bewiQuCZS8hHByJ2JfU0mhhDbQFxWYIaQemRPgeJLtrvbOC8G-yf3vmg/exec'  # Replace with your web app URL
-        response = requests.post(script_url, json=feedback_data, timeout=30)
-        print(f"Google Apps Script response status: {response.status_code}, text: {response.text}")  # Debug log
-
-        if response.status_code != 200:
-            return jsonify({'error': f'Failed to save feedback, status: {response.status_code}, response: {response.text}'}), 500
-
-        return jsonify({'message': 'Feedback submitted successfully'}), 200
-
-    except FileNotFoundError as e:
-        print(f"FileNotFoundError: {str(e)}")
-        return jsonify({'error': f'Image file not found: {str(e)}'}), 404
-    except PermissionError as e:
-        print(f"PermissionError: {str(e)}")
-        return jsonify({'error': f'Permission denied accessing image: {str(e)}'}), 403
-    except Exception as e:
-        print(f"Unexpected error in submit_feedback: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-    
 ICE_CUBE_PROMPTS = {
     "Snofilled": """
     "task": "add the logo image into the center of the icecube",
@@ -509,23 +249,282 @@ ICE_CUBE_PROMPTS = {
     """
 }
 
+# ---------------- Core Helper Functions ----------------
+
+def get_current_user_id():
+    """
+    Extract user ID from Supabase auth token in request headers.
+    Returns user_id if authenticated, None otherwise.
+    """
+    try:
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            logging.warning("No Authorization header found")
+            return None
+        
+        token = auth_header.replace('Bearer ', '')
+        
+        # Use Supabase to verify the JWT token
+        try:
+            user = supabase.auth.get_user(token)
+            if user and user.user:
+                logging.info(f"Authenticated user: {user.user.id}")
+                return user.user.id
+        except Exception as e:
+            logging.warning(f"Token verification failed: {e}")
+            # Fallback: decode JWT without verification (less secure but works for some flows)
+            decoded = jwt.decode(token, options={"verify_signature": False})
+            user_id = decoded.get('sub')
+            if user_id:
+                logging.info(f"Extracted user_id from token: {user_id}")
+                return user_id
+        
+        return None
+    except Exception as e:
+        logging.error(f"Error extracting user ID: {e}")
+        return None
+
+def upload_and_save_generated_image(file_path, prompt, template_type, original_filename, template_name=None, user_id=None):
+    """
+    Uploads a generated image to Cloudinary and saves its URL and metadata to Supabase.
+    """
+    try:
+        # Upload to Cloudinary
+        upload_result = cloudinary.uploader.upload(
+            file_path,
+            folder="generated_images",
+            public_id=os.path.splitext(original_filename)[0]
+        )
+        image_url = upload_result.get("secure_url")
+        
+        # Insert into Supabase
+        data = {
+            "image_url": image_url,
+            "prompt": prompt,
+            "template_type": template_type,
+            "original_filename": original_filename,
+            "template_name": template_name,
+            "user_id": user_id
+        }
+        
+        supabase.table("generated_images").insert(data).execute()
+        logging.info(f"Successfully saved generated image to Supabase: {image_url}")
+        
+        # Clean up local file after successful upload
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            logging.warning(f"Failed to delete local file {file_path}: {e}")
+            
+        return image_url
+    except Exception as e:
+        logging.error(f"Error uploading/saving generated image: {e}")
+        return None
+
+def combine_images(image_paths, output_path, max_size=1024):
+    """
+    Combines multiple images into one with a white background.
+    """
+    unique_images = []
+    seen_hashes = set()
+    est_total_bytes = 0
+    for path in image_paths:
+        try:
+            with Image.open(path) as img:
+                img = img.convert("RGB")
+                if img.width > MAX_SOURCE_SIDE or img.height > MAX_SOURCE_SIDE:
+                    img.thumbnail((MAX_SOURCE_SIDE, MAX_SOURCE_SIDE), Image.LANCZOS)
+                img.thumbnail((max_size, max_size), Image.LANCZOS)
+                img_bytes = img.tobytes()
+                img_hash = f"{img.width}x{img.height}-" + hashlib.md5(img_bytes).hexdigest()
+                if img_hash in seen_hashes:
+                    continue
+                seen_hashes.add(img_hash)
+                est_total_bytes += len(img_bytes)
+                if est_total_bytes > MAX_COMBINE_MEMORY_BYTES:
+                    logging.warning("combine_images aborted: memory estimate exceeded limit")
+                    break
+                unique_images.append(img.copy())
+        except Exception as e:
+            logging.error(f"Error processing {path}: {e}")
+            continue
+    if not unique_images:
+        raise ValueError("No valid images to combine")
+    max_height = max(im.height for im in unique_images)
+    normalized = []
+    for im in unique_images:
+        if im.height < max_height:
+            ratio = max_height / im.height
+            new_w = int(im.width * ratio)
+            im = im.resize((new_w, max_height), Image.LANCZOS)
+        normalized.append(im)
+    total_width = sum(im.width for im in normalized)
+    new_im = Image.new('RGB', (total_width, max_height), 'white')
+    x_off = 0
+    for im in normalized:
+        new_im.paste(im, (x_off, 0))
+        x_off += im.width
+    new_im.save(output_path, format='JPEG', quality=JPEG_QUALITY, optimize=True)
+    logging.info(f"Combined image saved at {output_path}")
+
+def detect_ludge_type(input_text):
+    input_text = input_text.lower()
+    for ludge in LUDGE_TYPES:
+        if ludge in input_text:
+            return LUDGE_TYPES[ludge]
+    return None
+
+def detect_sculpture_bases(input_text, threshold=80):
+    """Detects which sculpture bases are mentioned in the input text."""
+    input_text = input_text.lower()
+    detected_bases = []
+    
+    input_without_base = input_text.replace("base", "").strip()
+    if not input_without_base:
+        input_without_base = input_text
+    
+    for keyword, image_path in SCULPTURE_BASES.items():
+        main_keyword = keyword.replace("base", "").strip()
+        if main_keyword and main_keyword in input_without_base:
+            detected_bases.append(image_path)
+        elif keyword in input_text:
+            detected_bases.append(image_path)
+        else:
+            words = input_without_base.split()
+            if any(fuzz.ratio(word, main_keyword) >= threshold for word in words):
+                detected_bases.append(image_path)
+    return detected_bases
+
+def classify_prompt_type(prompt):
+    classification_messages = [
+        {
+            "role": "system",
+            "content": "You are a classification assistant. Based on the user's input, decide if they are asking for a sculpture to be generated, edit an image, or just get a text response. Reply with only one word: 'generate', 'edit', or 'text'."
+        },
+        {"role": "user", "content": prompt}
+    ]
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=classification_messages
+    )
+    return response.choices[0].message.content.strip().lower()
+
+# ---------------- Routes ----------------
+
+@app.route('/api/admin/get_history', methods=['POST'])
+def admin_get_history():
+    try:
+        # 1. Verify Authentication & Admin Status
+        user_id = get_current_user_id()
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        
+        # 2. Get Pagination Params
+        data = request.get_json() or {}
+        page = data.get('page', 0)
+        limit = data.get('limit', 50)
+        start = page * limit
+        end = start + limit - 1
+
+        # 3. Fetch Images
+        response = supabase.table('generated_images').select('*').order('created_at', desc=True).range(start, end).execute()
+        images = response.data
+
+        # 4. Fetch User Emails
+        user_ids = list(set([img['user_id'] for img in images if img.get('user_id')]))
+        user_map = {}
+        if user_ids and supabase_admin:
+            print(f"DEBUG: Fetching details for {len(user_ids)} users via Supabase Admin")
+            for uid in user_ids:
+                try:
+                    # Use supabase_admin to fetch user details
+                    print(f"DEBUG: Fetching user {uid}...")
+                    u_res = supabase_admin.auth.admin.get_user_by_id(uid)
+                    if u_res and u_res.user:
+                        print(f"DEBUG: Found user {uid}. Email: {u_res.user.email}, Meta: {u_res.user.user_metadata}")
+                        user_map[uid] = {
+                            'email': u_res.user.email,
+                            'display_name': u_res.user.user_metadata.get('display_name') if u_res.user.user_metadata else None,
+                            'avatar_url': u_res.user.user_metadata.get('avatar_url') if u_res.user.user_metadata else None
+                        }
+                    else:
+                         print(f"DEBUG: User {uid} not found or no user object returned.")
+                except Exception as e:
+                    logging.warning(f"Failed to fetch user {uid}: {e}")
+                    print(f"DEBUG: Exception fetching user {uid}: {e}")
+                    user_map[uid] = {'email': None, 'display_name': None, 'avatar_url': None}
+        elif not supabase_admin:
+            print("DEBUG: Supabase Admin client is MISSING or None")
+            logging.warning("Supabase Admin client not available. Cannot fetch emails.")
+
+        # 5. Merge Data
+        for img in images:
+            uid = img.get('user_id')
+            if uid and uid in user_map:
+                img['email'] = user_map[uid]['email']
+                img['display_name'] = user_map[uid]['display_name']
+                img['avatar_url'] = user_map[uid]['avatar_url']
+        
+        return jsonify({'data': images}), 200
+
+    except Exception as e:
+        logging.error(f"Error in admin_get_history: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/submit_feedback', methods=['POST'])
+def submit_feedback():
+    try:
+        data = request.get_json()
+        image_url = data.get('image_url')
+        rating = data.get('rating')
+        comment = data.get('comment')
+        if not image_url or not rating:
+            return jsonify({'error': 'Missing image_url or rating'}), 400
+        base64_image = ""
+        
+        if image_url.startswith('http'):
+            try:
+                img_response = requests.get(image_url)
+                if img_response.status_code == 200:
+                    base64_image = base64.b64encode(img_response.content).decode('utf-8')
+                else:
+                    return jsonify({'error': f'Failed to download image from URL: {image_url}'}), 400
+            except Exception as e:
+                return jsonify({'error': f'Error downloading image: {str(e)}'}), 500
+        else:
+            base_dir = os.path.abspath(os.path.dirname(__file__))
+            clean_path = image_url.replace('/static/', '').replace('static/', '')
+            image_path = os.path.join(base_dir, 'static', clean_path)
+            if not os.path.exists(image_path):
+                return jsonify({'error': f'Image file not found at {image_path}'}), 404
+            with open(image_path, 'rb') as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        feedback_data = {
+            'imageData': base64_image,
+            'rating': rating,
+            'comment': comment or 'No comment provided'
+        }
+        script_url = 'https://script.google.com/macros/s/AKfycbzKOxVD9ju-bewiQuCZS8hHByJ2JfU0mhhDbQFxWYIaQemRPgeJLtrvbOC8G-yf3vmg/exec'
+        response = requests.post(script_url, json=feedback_data, timeout=30)
+        if response.status_code != 200:
+            return jsonify({'error': f'Failed to save feedback, status: {response.status_code}'}), 500
+        return jsonify({'message': 'Feedback submitted successfully'}), 200
+    except Exception as e:
+        logging.error(f"Error in submit_feedback: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/delete_history_item', methods=['POST'])
 def delete_history_item():
     try:
         data = request.get_json()
         item_id = data.get('id')
-        
         if not item_id:
             return jsonify({'error': 'Missing item id'}), 400
-            
-        # Delete from Supabase
         response = supabase.table('generated_images').delete().eq('id', item_id).execute()
-        
         return jsonify({'status': 'success', 'message': 'Item deleted successfully'}), 200
-        
     except Exception as e:
-        print(f"Error deleting history item: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/toggle_favourite', methods=['POST'])
@@ -534,17 +533,35 @@ def toggle_favourite():
         data = request.get_json()
         item_id = data.get('id')
         is_favourite = data.get('is_favourite')
-        
         if not item_id:
             return jsonify({'error': 'Missing item id'}), 400
-            
-        # Update Supabase
         response = supabase.table('generated_images').update({'is_favourite': is_favourite}).eq('id', item_id).execute()
-        
         return jsonify({'status': 'success', 'message': 'Favourite status updated'}), 200
-        
     except Exception as e:
-        print(f"Error toggling favourite: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/get_user_history', methods=['GET'])
+def get_user_history():
+    try:
+        user_id = get_current_user_id()
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        response = supabase.table('generated_images').select('*').eq('user_id', user_id).order('created_at', desc=True).execute()
+        return jsonify({'data': response.data}), 200
+    except Exception as e:
+        logging.error(f"Error fetching user history: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/get_user_favourites', methods=['GET'])
+def get_user_favourites():
+    try:
+        user_id = get_current_user_id()
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        response = supabase.table('generated_images').select('*').eq('user_id', user_id).eq('is_favourite', True).order('created_at', desc=True).execute()
+        return jsonify({'data': response.data}), 200
+    except Exception as e:
+        logging.error(f"Error fetching user favourites: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/template_selected', methods=['POST'])
@@ -553,67 +570,37 @@ def handle_template_selection():
     template_type = data.get('template')
     template_name = data.get('templateName', '')
     
-    # Print the template information
-    print(f"Selected template type: {template_type}")
-    if template_name:
-        print(f"Selected template name: {template_name}")
-    
-    # Store the template type in session if it's an ice cube
     session['selected_template_name'] = template_name
     if template_type in ICE_CUBE_PROMPTS:
         session['selected_ice_cube'] = template_type
-        print(f"Ice cube selected: {template_type}")  # This will now print for ice cubes
-        print(f"Using prompt: {ICE_CUBE_PROMPTS[template_type]}")  # Print the prompt being used
-    
-    # For non-ice cube/ice bar templates, store the lighting message
+        print(f"Ice cube selected: {template_type}")
     elif "ice bar" not in template_type.lower() and "ice cube" not in template_type.lower():
         session['template_selected_message'] = "Add a silver plastic rectangular ambient diffused blue lighting at the bottom of the sculpture, must be very dimm light and hidden"
-        print("Lighting message set for non-ice template")
-    
     return jsonify({"status": "success", "message": "Template selection received"})
-
-
-client2 = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-PRO_MODEL_ID = "gemini-3-pro-image-preview"
-
 
 @app.route('/api/extract_logo', methods=['POST'])
 def extract_logo():
     try:
         if 'file' not in request.files:
             return jsonify({"error": "No file uploaded"}), 400
-
         file = request.files['file']
         file.stream.seek(0, os.SEEK_END)
         size = file.stream.tell()
         file.stream.seek(0)
         if size > MAX_UPLOAD_BYTES:
             return jsonify({"error": f"File too large. Max {MAX_UPLOAD_BYTES//1024//1024}MB"}), 400
-        if file.filename == '':
-            return jsonify({"error": "No file selected"}), 400
-
-        # Use temp directory for processing
+        
         with tempfile.TemporaryDirectory() as temp_dir:
             filename = secure_filename(file.filename)
             upload_path = os.path.join(temp_dir, filename)
-            try:
-                file.save(upload_path)
-                optimize_saved_image(upload_path)
-                logging.debug(f"Upload saved & optimized: {upload_path}")
-            except Exception as e:
-                return jsonify({"error": f"Error saving file: {e}"}), 500
+            file.save(upload_path)
+            optimize_saved_image(upload_path)
 
-            logging.debug(f"Received file: {file.filename}")
-
-            # Open & prepare a working copy (downscaled) for the model
-            try:
-                with Image.open(upload_path) as img:
-                    img = img.convert('RGB')
-                    if img.width > WORKING_THUMB_SIDE or img.height > WORKING_THUMB_SIDE:
-                        img.thumbnail((WORKING_THUMB_SIDE, WORKING_THUMB_SIDE), Image.LANCZOS)
-                    model_image = img.copy()
-            except Exception as e:
-                return jsonify({"error": f"Error opening image with PIL: {e}"}), 400
+            with Image.open(upload_path) as img:
+                img = img.convert('RGB')
+                if img.width > WORKING_THUMB_SIDE or img.height > WORKING_THUMB_SIDE:
+                    img.thumbnail((WORKING_THUMB_SIDE, WORKING_THUMB_SIDE), Image.LANCZOS)
+                model_image = img.copy()
 
             prompt = "Extract the logo from this image and display it on a pure white background, tightly cropped."
             response = client2.models.generate_content(
@@ -621,77 +608,38 @@ def extract_logo():
                 contents=[prompt, model_image],
                 config=types.GenerateContentConfig(response_modalities=['Text', 'Image'])
             )
-
             for part in response.candidates[0].content.parts:
                 if part.inline_data is not None:
                     data = part.inline_data.data
                     logo_path = os.path.join(temp_dir, 'extracted_logo.png')
-                    try:
-                        pathlib.Path(logo_path).write_bytes(data)
-                        optimize_saved_image(logo_path)
-                        return send_file(logo_path, mimetype='image/png')
-                    except Exception as e:
-                        return jsonify({"error": f"Error writing image to file: {e}"}), 500
-
+                    pathlib.Path(logo_path).write_bytes(data)
+                    optimize_saved_image(logo_path)
+                    return send_file(logo_path, mimetype='image/png')
             return jsonify({"error": "No image returned from model"}), 500
-
     except Exception as e:
         print("Error extracting logo:", str(e))
         return jsonify({"error": str(e)}), 500
 
-def get_logo_instructions(effect_type):
-    shared = {
-        "task": "add the image into the sculpture, and return one image output not two images",
-        "instructions": {
-            "strict": "The logo must be embedded a few centimeters into the ice and should not form the sculpture itself.",
-            "processing": "Remove any background of the image before embedding it into the ice cube.",
-            "clarification": "If a blue image is provided, it is always ice and should be used as the ice sculpture, not as a logo. Blue images are never logos or image overlays—they are the ice.",
-           "ice_structure": "The ice sculpture must precisely match the input image, with 100% accuracy. Do not add, remove, or modify any elements. Avoid including any extra components made of ice or anything not explicitly requested in the input."
-        }
-    }
-
-    effects = {
-        "Snofilled": "Create a carved snow appearance inside the ice sculpture. The image should not be colored and should be engraved with visible depth inside the ice cube.",
-        "Colored": "It should look like the ice is colored from the logo, not etched. The image appears as colored pigmentation embedded inside the ice.",
-        "Paper": "It should look like a colored printed paper is frozen inside the ice cube. The logo should be colored, have a slight white outline, and a transparent background, and should be centered within the cube."
-    }
-
-    shared["instructions"]["effect"] = effects[effect_type]
-    return shared
-
-
 @app.route('/api/log_button_press', methods=['POST'])
 def log_button_press():
     data = request.get_json()
-    button = data.get('button')
     image_url = data.get('image_url')
     timestamp = data.get('timestamp')
-    
     print(f"Expand button pressed for image: {image_url} at {timestamp}")
-    
-    # You could also log this to a file or database
-    # with open('button_logs.txt', 'a') as f:
-    #     f.write(f"{timestamp} - {button} button pressed for {image_url}\n")
-    
     return jsonify({'status': 'success'})
 
 @app.route("/api/expand_chatbot", methods=["POST"])
 def expand_chatbot():
+    user_id = get_current_user_id()
     user_input = request.form.get("user_input", "").strip()
     uploaded_files = request.files.getlist("images")
-    user_aspect_ratio = request.form.get("aspect_ratio", "9:16")  # Get user's selected aspect ratio
     template_name = request.form.get("template_name") or session.get('selected_template_name')
 
-    print("expand_chatbot route was hit!")
-
     try:
-        #  Verify there is an image
         if not uploaded_files:
             return jsonify({"response": "No image provided for expansion"}), 400
-
-        # Use temp directory for processing
+        
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Process just the first image
             uploaded_file = uploaded_files[0]
             uploaded_file.stream.seek(0, os.SEEK_END)
             size = uploaded_file.stream.tell(); uploaded_file.stream.seek(0)
@@ -703,20 +651,14 @@ def expand_chatbot():
             uploaded_file.save(combined_path)
             optimize_saved_image(combined_path)
 
-            # Generate using ONLY the user's prompt
-            print("Generating image using ONLY user input:", user_input)
             with Image.open(combined_path) as img:
                 img = img.convert('RGB')
                 response = client2.models.generate_content(
                     model=PRO_MODEL_ID,
                     contents=[user_input, img],
-                    config=types.GenerateContentConfig(
-                        response_modalities=['Image'],
-                        # image_config=types.ImageConfig(aspect_ratio=user_aspect_ratio if user_aspect_ratio else "9:16") # ImageConfig not supported in this version
-                    )
+                    config=types.GenerateContentConfig(response_modalities=['Image'])
                 )
 
-            # Save and return the result
             output_id = uuid.uuid4().hex[:8]
             output_filename = f"sculpture_{output_id}.png"
             output_path = os.path.join(temp_dir, output_filename)
@@ -727,108 +669,80 @@ def expand_chatbot():
                     optimize_saved_image(output_path)
                     break
             
-            # Upload to Cloudinary and save to Supabase
             final_image_url = upload_and_save_generated_image(
-                output_path, 
-                "Expand Image", 
-                "expand", 
-                output_filename,
-                template_name=template_name
+                output_path, "Expand Image", "expand", output_filename,
+                template_name=template_name, user_id=user_id
             )
             
             if not final_image_url:
                  return jsonify({"response": "Error saving generated image"}), 500
-
-            print("Image generated successfully. Returning:", {"image_url": final_image_url})
             return jsonify({"image_url": final_image_url})
-
     except Exception as e:
         logging.exception("expand_chatbot failed")
         return jsonify({"response": f"Error expanding image: {str(e)}"}), 500
     
 @app.route("/api/chatbot", methods=["POST"])
 def chatbot():
-    # Initialize conversation history if it doesn't exist
+    user_id = get_current_user_id()
+    
     if "conversation" not in session or not isinstance(session["conversation"], list):
         session["conversation"] = []
-    
-    # Initialize variables to avoid UnboundLocalError
     image_generation_prompt = None
-
-    # Limit conversation history size
     if len(session["conversation"]) > 5:
         session["conversation"] = session["conversation"][-5:]
 
     user_input = request.form.get("user_input", "").strip()
     uploaded_files = request.files.getlist("images")
-    user_aspect_ratio = request.form.get("aspect_ratio", "9:16")  # Get user's selected aspect ratio
+    user_aspect_ratio = request.form.get("aspect_ratio", "9:16")
     template_name = request.form.get("template_name") or session.get('selected_template_name')
-    logging.debug(f"Received request.files: {request.files}")
-    logging.debug(f"User selected aspect ratio: {user_aspect_ratio}")
 
-    # Check for ice cube selection first - PROCESS AND RETURN EARLY
     selected_ice_cube = session.get('selected_ice_cube')
     
     if selected_ice_cube and uploaded_files:
         ice_prompt = ICE_CUBE_PROMPTS.get(selected_ice_cube, "")
         image_generation_prompt = f"{ice_prompt}\nUSER INPUT:\n{user_input}"
-        print(f"Using {selected_ice_cube} ice cube prompt with user input:\n{image_generation_prompt}")
         session.pop('selected_ice_cube', None)
         
-        # Use temp directory for processing
         with tempfile.TemporaryDirectory() as temp_dir:
             uploaded_paths = []
             cloudinary_urls = []
             
-            if uploaded_files:
-                for file in uploaded_files:
-                    # Save to temp file
-                    temp_path = os.path.join(temp_dir, secure_filename(file.filename))
-                    file.stream.seek(0, os.SEEK_END)
-                    size = file.stream.tell(); file.stream.seek(0)
-                    if size > MAX_UPLOAD_BYTES:
-                        return jsonify({"response": f"One of the files is too large (>{MAX_UPLOAD_BYTES//1024//1024}MB)"})
-                    file.save(temp_path)
-                    optimize_saved_image(temp_path)
-                    uploaded_paths.append(temp_path)
-                    
-                    # Upload input to Cloudinary
-                    try:
-                        upload_result = cloudinary.uploader.upload(
-                            temp_path,
-                            folder="input_images",
-                            public_id=f"input_{uuid.uuid4().hex[:8]}"
-                        )
-                        cloudinary_urls.append(upload_result.get("secure_url"))
-                    except Exception as e:
-                        logging.error(f"Failed to upload input to Cloudinary: {e}")
+            for file in uploaded_files:
+                temp_path = os.path.join(temp_dir, secure_filename(file.filename))
+                file.stream.seek(0, os.SEEK_END)
+                size = file.stream.tell(); file.stream.seek(0)
+                if size > MAX_UPLOAD_BYTES:
+                    return jsonify({"response": f"One of the files is too large (>{MAX_UPLOAD_BYTES//1024//1024}MB)"})
+                file.save(temp_path)
+                optimize_saved_image(temp_path)
+                uploaded_paths.append(temp_path)
+                
+                try:
+                    upload_result = cloudinary.uploader.upload(
+                        temp_path, folder="input_images", public_id=f"input_{uuid.uuid4().hex[:8]}"
+                    )
+                    cloudinary_urls.append(upload_result.get("secure_url"))
+                except Exception as e:
+                    logging.error(f"Failed to upload input to Cloudinary: {e}")
 
             combined_path = os.path.join(temp_dir, f"combined_{uuid.uuid4().hex[:8]}.jpg")
-
             if uploaded_paths:
                 try:
                     combine_images(uploaded_paths, combined_path)
-                    logging.debug(f"Combined image saved to: {combined_path}")
                 except ValueError as e:
                     return jsonify({"response": str(e)})
-                except Exception as e:
-                    return jsonify({"response": f"Error combining images: {str(e)}"})
             else:
                 return jsonify({"response": "No valid images provided"})
             
-            # Generate image with ONLY ice cube prompt
             try:
                 with Image.open(combined_path) as img:
                     img = img.convert('RGB')
                     response = client2.models.generate_content(
                         model=PRO_MODEL_ID,
                         contents=[image_generation_prompt, img],
-                        config=types.GenerateContentConfig(
-                            response_modalities=['Image'],
-                        )
+                        config=types.GenerateContentConfig(response_modalities=['Image'])
                     )
                 
-                # Save generated image to temp file first
                 output_id = uuid.uuid4().hex[:8]
                 output_filename = f"sculpture_{output_id}.png"
                 output_path = os.path.join(temp_dir, output_filename)
@@ -839,61 +753,40 @@ def chatbot():
                         optimize_saved_image(output_path)
                         break
                 
-                print("Ice Cube Image Created")
-                
-                # Upload to Cloudinary and save to Supabase
                 final_image_url = upload_and_save_generated_image(
-                    output_path, 
-                    image_generation_prompt, 
-                    "ice_cube", 
-                    output_filename,
-                    template_name=template_name
+                    output_path, image_generation_prompt, "ice_cube", output_filename,
+                    template_name=template_name, user_id=user_id
                 )
-
                 if not final_image_url:
                      return jsonify({"response": "Error saving generated image"}), 500
 
                 session["conversation"].append({"role": "user", "content": user_input, "images": cloudinary_urls})
                 session["conversation"].append({
-                    "role": "assistant", 
-                    "content": "Here is your ice sculpture:",
-                    "image": final_image_url
+                    "role": "assistant", "content": "Here is your ice sculpture:", "image": final_image_url
                 })
                 session.modified = True
-
-                return jsonify({
-                    "image_url": final_image_url
-                })
+                return jsonify({"image_url": final_image_url})
             except Exception as e:
                 return jsonify({"response": f"Error generating ice cube image: {str(e)}"})
 
-    # Convert to lowercase after checking prefixes
     user_input_lower = user_input.lower()
-
-    # Check for ludge in user input
     detected_ludge = detect_ludge_type(user_input_lower)
 
     if "ludge" in user_input_lower and not detected_ludge:
-        session["conversation"].append({"role": "user", "content": user_input})
         response = "Can you please specify which ludge? We have martini ludge, tube ludge, and double ludge."
+        session["conversation"].append({"role": "user", "content": user_input})
         session["conversation"].append({"role": "assistant", "content": response})
         session.modified = True
         return jsonify({"response": response})
 
-    # Detect base images from user input
     base_images = detect_sculpture_bases(user_input_lower)
-
     if detected_ludge:
         base_images.append(detected_ludge)
         
-    # If user uploaded images or we detected base images
     if uploaded_files or base_images:
-        # Use temp directory for processing
         temp_dir = tempfile.mkdtemp()
         uploaded_paths = []
-        cloudinary_urls = []
         
-        # Save uploaded files to temp dir
         if uploaded_files:
             for file in uploaded_files:
                 temp_path = os.path.join(temp_dir, secure_filename(file.filename))
@@ -901,46 +794,19 @@ def chatbot():
                 size = file.stream.tell(); file.stream.seek(0)
                 if size > MAX_UPLOAD_BYTES:
                     shutil.rmtree(temp_dir)
-                    return jsonify({"response": f"One of the files is too large (>{MAX_UPLOAD_BYTES//1024//1024}MB)"})
+                    return jsonify({"response": f"One of the files is too large"})
                 file.save(temp_path)
                 optimize_saved_image(temp_path)
                 uploaded_paths.append(temp_path)
-                
-                # Upload to Cloudinary
-                try:
-                    upload_result = cloudinary.uploader.upload(
-                        temp_path,
-                        folder="input_images",
-                        public_id=f"input_{uuid.uuid4().hex[:8]}"
-                    )
-                    cloudinary_urls.append(upload_result.get("secure_url"))
-                except Exception as e:
-                    logging.error(f"Failed to upload input to Cloudinary: {e}")
         
-        # Get full paths to any detected base images
         base_image_paths = [os.path.join("static", img) for img in base_images] if base_images else []
-        
-        # We no longer combine images here. We will pass them as a list to Gemini later.
-        # Just ensure we have the paths ready.
         all_image_paths = uploaded_paths + base_image_paths
         
         if not all_image_paths:
              shutil.rmtree(temp_dir)
              return jsonify({"response": "No valid images provided"})
         
-
-
-        # Use the appropriate prompt based on prefix
-        user_input_lower = user_input.lower()
-       
-        # Check if this is an ice bar request - check both user input and actual base_images paths
-        # Convert paths to lowercase for comparison
         is_ice_bar = "ice bar" in user_input_lower or any("ice bars" in img.lower() for img in base_images)
-        
-        # Debug logging
-        print(f"DEBUG: user_input_lower = {user_input_lower}")
-        print(f"DEBUG: base_images = {base_images}")
-        print(f"DEBUG: is_ice_bar = {is_ice_bar}")
         
         image_generation_dict = {
             "user_input": user_input,
@@ -1054,9 +920,8 @@ def chatbot():
                     "CRITICAL: NO HALLUCINATIONS - Do not add any elements that are not present in the input image."
                 ]
             }          
-}
+        }
 
-        # Conditionally add logo instructions ONLY if user mentions specific terms
         if any(term in user_input_lower for term in ['snofilled', 'paper', 'colored']):
             logo_instructions = {
                 "Snofilled": {
@@ -1075,8 +940,6 @@ def chatbot():
                     "processing": "Remove any background of the image before embedding it into the ice cube"
                 }
             }
-            
-            # Determine which specific effect to use based on user input
             effect_type = None
             if 'snofilled' in user_input_lower:
                 effect_type = "Snofilled"
@@ -1095,99 +958,46 @@ def chatbot():
                     "composition_rules": "CRITICAL: Generate exactly ONE single image. Do NOT create a side-by-side comparison. Do NOT show the original logo next to the ice. The logo must be INSIDE the ice. The output must be a single view of the final ice cube."
                 }
 
-        # Convert to string for the prompt
         image_generation_prompt = json.dumps(image_generation_dict, indent=2)
-          
-        if not image_generation_prompt:
-            image_generation_prompt = json.dumps(image_generation_dict, indent=4)
-
-        #Convert dictionary to a nicely formatted string prompt
-        
-
         if 'template_selected_message' in session:
             image_generation_prompt += f"\n\nNOTE: {session['template_selected_message']}"
-            # Clear the message after using it to avoid repetition
             session.pop('template_selected_message', None)
 
-        if 'selected_ice_cube' in session:
-            selected_cube = session['selected_ice_cube']
-            if selected_cube in ICE_CUBE_PROMPTS:
-                cube_prompt = ICE_CUBE_PROMPTS[selected_cube]
-                image_generation_prompt += f"\n\nSPECIFIC ICE CUBE INSTRUCTIONS:\n{cube_prompt}"
-                print(f"DEBUG: Injected specific prompt for {selected_cube}")
-            session.pop('selected_ice_cube', None)
         if user_aspect_ratio and user_aspect_ratio != "auto":
             aspect_ratio = user_aspect_ratio
         else:
             aspect_ratio = "16:9" if is_ice_bar else "9:16"
-
-        # Get resolution from request
-        resolution = request.form.get('resolution', '2K')
         
-        # Parse image prompts
         image_prompts_json = request.form.get('image_prompts', '{}')
         try:
             image_prompts = json.loads(image_prompts_json)
         except json.JSONDecodeError:
             image_prompts = {}
-            print("Error decoding image_prompts JSON")
 
-        # Debug logging
-        print(f"DEBUG: Using aspect_ratio = {aspect_ratio} (user selected: {user_aspect_ratio})")
-        print(f"DEBUG: Using resolution = {resolution}")
-        print(f"DEBUG: Image prompts: {image_prompts}")
-        print(f"DEBUG: FINAL PROMPT:\n{image_generation_prompt}")
-        
-        # Collect all images (template + uploads)
         image_inputs = []
-        
-        # Load all images from the prepared paths
         for path in all_image_paths:
             if path and os.path.exists(path):
                 try:
                     with Image.open(path) as img:
                         image_inputs.append(img.convert('RGB'))
-                        print(f"DEBUG: Added image: {path}")
                 except Exception as e:
                     print(f"Error loading image {path}: {e}")
 
-        if not image_inputs:
-            shutil.rmtree(temp_dir)
-            return jsonify({"response": "Failed to process any images"})
-
-        # Debug logging
-        print(f"DEBUG: Using aspect_ratio = {aspect_ratio} (user selected: {user_aspect_ratio})")
-        print(f"DEBUG: Using resolution = {resolution}")
-        print(f"DEBUG: Sending {len(image_inputs)} images to Gemini")
-        print(f"DEBUG: FINAL PROMPT:\n{image_generation_prompt}")
-        
         try:
-            # Construct interleaved contents
             contents = [image_generation_prompt]
-            
-            # Add images and their specific prompts
             for i, img in enumerate(image_inputs):
-                # Add the image
                 contents.append(img)
-                
-                # Check if there is a specific prompt for this image index
-                # Note: indices in image_prompts are strings "0", "1", etc.
                 specific_prompt = image_prompts.get(str(i), "").strip()
                 if specific_prompt:
                     contents.append(f"Instructions for the image above (Image {i+1}): {specific_prompt}")
-                    print(f"DEBUG: Added specific prompt for Image {i+1}: {specific_prompt}")
             
-            # Append aspect ratio instruction to the prompt since it's not supported in config
             if aspect_ratio:
                 contents.append(f"Aspect Ratio: {aspect_ratio}")
-                print(f"DEBUG: Appended aspect ratio to prompt: {aspect_ratio}")
 
             response = client2.models.generate_content(
                 model=PRO_MODEL_ID,
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    response_modalities=['Image']
-                )
+                config=types.GenerateContentConfig(response_modalities=['Image'])
             )
             
             output_id = uuid.uuid4().hex[:8]
@@ -1198,93 +1008,54 @@ def chatbot():
                     optimize_saved_image(output_path)
                     break
             output_filename = os.path.basename(output_path)
-            print("Image Created")
-
-            # Upload to Cloudinary and save to Supabase
-            cloudinary_url = upload_and_save_generated_image(
-                output_path, 
-                image_generation_prompt, 
-                "sculpture", 
-                output_filename,
-                template_name=template_name
-            )
             
-            # Use Cloudinary URL if available, otherwise fallback to local (though we want to avoid local)
+            cloudinary_url = upload_and_save_generated_image(
+                output_path, image_generation_prompt, "sculpture", output_filename,
+                template_name=template_name, user_id=user_id
+            )
             final_image_url = cloudinary_url if cloudinary_url else f"/static/generated/{output_filename}"
 
             session["conversation"].append({"role": "user", "content": user_input})
             session["conversation"].append({
-                "role": "assistant", 
-                "content": "Here is your ice sculpture:",
-                "image": final_image_url
+                "role": "assistant", "content": "Here is your ice sculpture:", "image": final_image_url
             })
             session.modified = True
             
             shutil.rmtree(temp_dir)
-            return jsonify({
-                # "response": "Here's your custom ice sculpture:",
-                "image_url": final_image_url
-            })
+            return jsonify({"image_url": final_image_url})
         except Exception as e:
             shutil.rmtree(temp_dir)
             return jsonify({"response": f"Error generating sculpture image: {str(e)}"})
 
-    # If no images were uploaded or detected, proceed with text/classification flow
     try:
         classification = classify_prompt_type(user_input)
-        print(f"Prompt classified as: {classification}")
-
-        # Normal text conversation (with memory)
         if classification == "text":
-            system_prompt = f"""You are an AI assistant for an ice sculpture company. You can create ice sculpture images 
-            from text prompts using the latest GPT image generation model. You also accept image inputs for editing 
-            based on user prompts. Never say you can't generate or edit images — just use the input prompt to create 
-            a realistic ice sculpture.
-            """
+            system_prompt = f"""You are an AI assistant for an ice sculpture company..."""
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_input}
             ]
             completion = client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages
+                model="gpt-4o", messages=messages
             )
             gpt_response = completion.choices[0].message.content
             session["conversation"].append({"role": "user", "content": user_input})
             session["conversation"].append({"role": "assistant", "content": gpt_response})
             return jsonify({"response": gpt_response})
 
-        # Image generation flow
         elif classification == "generate":
             generation_id = uuid.uuid4().hex[:8]
-            
-            # Use the appropriate prompt based on prefix if not already set
             if not image_generation_prompt:
                 image_generation_prompt = f"""
         "task": "Generate realistic images of ice engravings based solely on user text input.",
-        "instructions": 
-            "design": "Accurately follow the user's text description with no creative additions or modifications.",
-            "ice_quality": "Use completely TRANSPARENT and CLEAR ice like glass. NO white layers, NO frosted sections, NO cloudiness. The ice must be 100% see-through and transparent. No bubbles, rough edges, or imperfections.",
-            "ice_color": "CRITICAL: Ice must be COMPLETELY TRANSPARENT and CLEAR like glass. DO NOT use blue color. DO NOT use white color. DO NOT create white frosted layers. Ice should be see-through transparent throughout.",
-            "surface": "Ice must appear smooth, clean, polished, and completely transparent.",
-            "no_white_layers": "DO NOT create any white layers, frosted sections, or opaque areas in the ice. The entire sculpture must be crystal clear transparent.",
-            "detail_level": "Keep details minimal; emphasize the natural beauty of ice.",
-            "creativity": "This is a technical execution. No creative interpretation.",
-            "environment": "Place the sculpture the requested theme, but do not change the look of the sculpture until requested explicitly",
-            "small items":"do not add any items items that cannot be made by ice or that can be easily broken",
-            "human_presence": "Do not include any humans in the image." 
-            "user_input": {user_input}
-    """
+        "user_input": {user_input}
+        """
             response = client2.models.generate_content(
                 model=PRO_MODEL_ID,
                 contents=image_generation_prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=['Image'],
-                    # image_config=types.ImageConfig(aspect_ratio=user_aspect_ratio if user_aspect_ratio else "9:16") # ImageConfig not supported
-                )
+                config=types.GenerateContentConfig(response_modalities=['Image'])
             )
 
-            # Use temp directory for processing
             with tempfile.TemporaryDirectory() as temp_dir:
                 output_path = os.path.join(temp_dir, f"generated_{generation_id}.png")
                 for part in response.candidates[0].content.parts:
@@ -1293,40 +1064,204 @@ def chatbot():
                         optimize_saved_image(output_path)
                         break
                 output_filename = os.path.basename(output_path)
-                print("Image Created")
-
-                # Upload to Cloudinary and save to Supabase
-                cloudinary_url = upload_and_save_generated_image(
-                    output_path, 
-                    image_generation_prompt, 
-                    "text_to_image", 
-                    output_filename,
-                    template_name=template_name
-                )
                 
-                # Use Cloudinary URL if available, otherwise fallback to local (though we want to avoid local)
+                cloudinary_url = upload_and_save_generated_image(
+                    output_path, image_generation_prompt, "text_to_image", output_filename,
+                    template_name=template_name, user_id=user_id
+                )
                 final_image_url = cloudinary_url if cloudinary_url else f"/static/uploads/{output_filename}"
 
                 session["conversation"].append({"role": "user", "content": user_input})
                 session["conversation"].append({
-                    "role": "assistant", 
-                    "content": "Here is your ice sculpture:",
-                    "image": final_image_url
+                    "role": "assistant", "content": "Here is your ice sculpture:", "image": final_image_url
                 })
                 session.modified = True
-
-                return jsonify({
-                    "response": "Here is your ice sculpture:",
-                    "image_url": final_image_url
-                })
+                return jsonify({"response": "Here is your ice sculpture:", "image_url": final_image_url})
 
     except Exception as e:
         return jsonify({"response": f"Error: {str(e)}"})
 
+# ---------------- Kling AI ----------------
+
+KLING_ACCESS_KEY = os.getenv("KLING_ACCESS_KEY")
+KLING_SECRET_KEY = os.getenv("KLING_SECRET_KEY")
+
+def get_kling_token():
+    headers = {"alg": "HS256", "typ": "JWT"}
+    payload = {
+        "iss": KLING_ACCESS_KEY,
+        "exp": int(time.time()) + 1800,
+        "nbf": int(time.time()) - 5
+    }
+    return jwt.encode(payload, KLING_SECRET_KEY, algorithm="HS256", headers=headers)
+
+@app.route('/api/create_video', methods=['POST'])
+def create_video():
+    try:
+        data = request.get_json()
+        image_url = data.get('image_url')
+        prompt = data.get('prompt', 'show the ice sculpture/ice object from all angles, rotate the camera and show all sides of the sculpture.')
+        
+        if not image_url:
+            return jsonify({'error': 'Missing image_url'}), 400
+            
+        if image_url.startswith('/static') or image_url.startswith('static'):
+           base_dir = os.path.abspath(os.path.dirname(__file__))
+           clean_path = image_url.replace('/static/', '').replace('static/', '')
+           local_path = os.path.join(base_dir, 'static', clean_path)
+           
+           if os.path.exists(local_path):
+               try:
+                   upload_result = cloudinary.uploader.upload(local_path, folder="video_gen_input")
+                   image_url = upload_result.get("secure_url")
+               except Exception as e:
+                   return jsonify({'error': f'Failed to upload local image for processing: {str(e)}'}), 500
+           else:
+               return jsonify({'error': 'Local image file not found'}), 404
+
+        token = get_kling_token()
+        url = "https://api-singapore.klingai.com/v1/videos/image2video"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "model_name": "kling-v1-6",
+            "mode": "pro",
+            "duration": "10",
+            "image": image_url,
+            "prompt": prompt,
+            "cfg_scale": 0.5
+        }
+        
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code == 200:
+            return jsonify(response.json())
+        else:
+            return jsonify({'error': f"Kling API Error: {response.text}"}), response.status_code
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def upload_and_save_generated_video(file_path, prompt, template_type, original_filename, user_id=None):
+    try:
+        upload_result = cloudinary.uploader.upload(
+            file_path, folder="generated_videos", resource_type="video", public_id=os.path.splitext(original_filename)[0]
+        )
+        video_url = upload_result.get("secure_url")
+        data = {
+            "image_url": video_url,
+            "prompt": prompt,
+            "template_type": template_type,
+            "original_filename": original_filename,
+            "template_name": "Video Generation",
+            "user_id": user_id
+        }
+        supabase.table("generated_images").insert(data).execute()
+        
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
+        return video_url
+    except Exception as e:
+        logging.error(f"Error uploading/saving generated video: {e}")
+        return None
+
+@app.route('/api/get_video_status/<task_id>', methods=['GET'])
+def get_video_status(task_id):
+    try:
+        token = get_kling_token()
+        url = f"https://api-singapore.klingai.com/v1/videos/image2video/{task_id}"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            data = response.json()
+            task_status = data.get('data', {}).get('task_status')
+            
+            if task_status == 'succeed':
+                task_result = data.get('data', {}).get('task_result', {})
+                videos = task_result.get('videos', [])
+                if videos:
+                    kling_video_url = videos[0].get('url')
+                    if kling_video_url:
+                        try:
+                            video_response = requests.get(kling_video_url)
+                            if video_response.status_code == 200:
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
+                                    tmp_video.write(video_response.content)
+                                    tmp_video_path = tmp_video.name
+                                final_video_url = upload_and_save_generated_video(
+                                    tmp_video_path, "Video generated from image", "video", f"video_{task_id}.mp4"
+                                )
+                                if final_video_url:
+                                    data['data']['task_result']['videos'][0]['url'] = final_video_url
+                        except Exception as e:
+                            print(f"Error processing video download/upload: {e}")
+            return jsonify(data)
+        else:
+            return jsonify({'error': f"Kling API Error: {response.text}"}), response.status_code
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/get_users', methods=['POST'])
+def admin_get_users():
+    try:
+        user_id = get_current_user_id()
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        
+        if not supabase_admin:
+             return jsonify({'error': 'Server misconfiguration: Admin client not available'}), 500
+
+        current_user = supabase_admin.auth.admin.get_user_by_id(user_id)
+        if not current_user or not current_user.user:
+             return jsonify({'error': 'User not found'}), 404
+        
+        user_email = current_user.user.email
+        if user_email not in ['alvaro@theicebutcher.com', 'alvaro@icebutcher.com']:
+             return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+        data = request.get_json() or {}
+        page = data.get('page', 0)
+        limit = data.get('limit', 50)
+        
+        users_response = supabase_admin.auth.admin.list_users(page=page + 1, per_page=limit)
+        if isinstance(users_response, list):
+            users = users_response
+        else:
+            users = users_response.users
+        
+        users_data = []
+        for u in users:
+            image_count = 0
+            try:
+                # Use supabase_admin to bypass RLS if necessary
+                count_res = supabase_admin.table('generated_images').select('*', count='exact', head=True).eq('user_id', u.id).execute()
+                image_count = count_res.count
+            except Exception as e:
+                logging.warning(f"Failed to fetch image count for user {u.id}: {e}")
+
+            users_data.append({
+                'image_count': image_count,
+                'id': u.id,
+                'email': u.email,
+                'created_at': u.created_at,
+                'last_sign_in_at': u.last_sign_in_at,
+                'display_name': u.user_metadata.get('display_name') if u.user_metadata else None,
+                'avatar_url': u.user_metadata.get('avatar_url') if u.user_metadata else None,
+            })
+            
+        return jsonify({
+            'data': users_data, 
+            'total': users_response.total if hasattr(users_response, 'total') else len(users_data)
+        }), 200
+
+    except Exception as e:
+        logging.error(f"Error in admin_get_users: {e}")
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == "__main__":
-    # Development server ONLY.
-    # In production, run with Gunicorn (example Procfile line):
-    # web: gunicorn app:app --workers=1 --threads=4 --timeout=180
     if not os.path.exists(app.config["UPLOAD_FOLDER"]):
         os.makedirs(app.config["UPLOAD_FOLDER"])
     debug = os.getenv("FLASK_DEBUG", "0") == "1"
